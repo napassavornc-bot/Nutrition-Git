@@ -2220,6 +2220,125 @@ async function tryGeminiModel(prompt, apiKey, modelName, disableThinking) {
   }
 }
 
+// ============ AI FOOD PHOTO ANALYSIS (Gemini Vision) ============
+// Resize + compress a photo before upload (~50-150KB JPEG) — handles iOS HEIC via native <img> decode
+function resizeImageToBase64(file, maxDim = 768, quality = 0.8) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      try {
+        resolve(canvas.toDataURL('image/jpeg', quality).split(',')[1]);
+      } catch (e) { reject(new Error('แปลงรูปไม่สำเร็จ')); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('อ่านไฟล์รูปไม่ได้')); };
+    img.src = url;
+  });
+}
+
+async function aiAnalyzeFoodImage(base64Jpeg, apiKey) {
+  if (!apiKey) throw new Error('ต้องใส่ Gemini API key ก่อน — ไปที่ ตั้งค่า → Google Gemini API Key');
+  if (apiKey.startsWith('sk-ant-')) throw new Error('ฟีเจอร์ถ่ายรูปรองรับเฉพาะ Gemini key (AIza...) — ขอฟรีที่ aistudio.google.com/apikey');
+  
+  const prompt = `You are a Thai nutrition expert analyzing a food photo. The image is ONE of these:
+A) A single plate/bowl of food (Thai dishes are most likely: กะเพรา, ข้าวมันไก่, ส้มตำ, ก๋วยเตี๋ยว, etc.)
+B) A packaged product's NUTRITION LABEL (ฉลากโภชนาการ) — Thai or English
+C) A packaged product front (brand visible but no label numbers)
+D) A SHARED Thai meal — multiple dishes on the table eaten together (กับข้าวจานกลาง เช่น ต้มยำ+ผัดผัก+ปลาทอด+ข้าวสวย)
+
+Rules:
+- Case A: identify the dish, estimate the ACTUAL portion visible in the photo (not a generic serving), estimate kcal/macros using Thai restaurant norms.
+- Case B: READ the numbers directly from the label. Use "ต่อหนึ่งหน่วยบริโภค" (per serving) values. Name = product name if visible.
+- Case C: identify brand+product, use known label data for that product in Thailand.
+- Case D: identify EVERY separate dish visible (including ข้าวสวย if present). For each dish give nutrition of the WHOLE dish as served. Use the "shared" output format.
+- Use case D whenever there are 2+ distinct dishes clearly meant for sharing. A single plate with rice+topping is case A.
+
+## OUTPUT for cases A/B/C (ONLY this JSON, no markdown):
+{
+  "name": "ชื่ออาหาร/ผลิตภัณฑ์ (ไทย)",
+  "serving": "ปริมาณที่เห็นในรูป เช่น 1 จาน, 1 ขวด 250ml",
+  "kcal": <integer>,
+  "protein": <number 1 decimal>,
+  "carb": <number 1 decimal>,
+  "fat": <number 1 decimal>,
+  "confidence": "high|medium|low",
+  "notes": "สั้นๆ: วิธีประเมิน/สิ่งที่เห็น เช่น 'อ่านจากฉลาก' หรือ 'ประเมินจากจานมาตรฐาน กะเพราไก่ไข่ดาว'"
+}
+
+## OUTPUT for case D (ONLY this JSON, no markdown):
+{
+  "shared": true,
+  "items": [
+    { "name": "ชื่อเมนู (ไทย)", "serving": "ทั้งจาน/ทั้งหม้อ ตามที่เห็น", "kcal": <integer ทั้งจาน>, "protein": <number>, "carb": <number>, "fat": <number> }
+  ],
+  "confidence": "high|medium|low",
+  "notes": "สั้นๆ เช่น 'โต๊ะอาหาร 4 เมนู + ข้าวสวย'"
+}`;
+  
+  const modelChain = [
+    { name: 'gemini-2.5-flash-lite', disableThinking: false },
+    { name: 'gemini-2.5-flash', disableThinking: true },
+    { name: 'gemini-flash-latest', disableThinking: false }
+  ];
+  let lastError = null;
+  for (const model of modelChain) {
+    try {
+      const generationConfig = { temperature: 0.2, maxOutputTokens: 1024, responseMimeType: 'application/json' };
+      if (model.disableThinking) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model.name}:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [
+            { inline_data: { mime_type: 'image/jpeg', data: base64Jpeg } },
+            { text: prompt }
+          ]}],
+          generationConfig
+        })
+      });
+      if (!response.ok) {
+        const errText = await response.text();
+        let errMsg = `Gemini API ${response.status}`;
+        try { errMsg = JSON.parse(errText).error?.message || errMsg; } catch (e) {}
+        const err = new Error(errMsg); err.status = response.status; throw err;
+      }
+      const data = await response.json();
+      const text = ((data.candidates || [])[0]?.content?.parts || []).map(p => p.text || '').join('');
+      const m = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
+      if (!m) throw new Error('AI ตอบกลับผิดรูปแบบ ลองถ่ายใหม่ให้ชัดขึ้น');
+      const obj = JSON.parse(m[0]);
+      if (obj.shared && Array.isArray(obj.items) && obj.items.length > 0) {
+        obj.items = obj.items.map(it => ({
+          name: it.name || 'เมนู',
+          serving: it.serving || 'ทั้งจาน',
+          kcal: Math.round(Number(it.kcal) || 0),
+          protein: Number(it.protein) || 0,
+          carb: Number(it.carb) || 0,
+          fat: Number(it.fat) || 0
+        })).filter(it => it.kcal > 0);
+        if (obj.items.length === 0) throw new Error('AI อ่านเมนูจากรูปไม่ได้ ลองถ่ายใหม่');
+        return obj;
+      }
+      if (!obj.name || obj.kcal == null) throw new Error('AI อ่านข้อมูลจากรูปไม่ได้ ลองถ่ายใหม่');
+      obj.kcal = Math.round(Number(obj.kcal) || 0);
+      obj.protein = Number(obj.protein) || 0;
+      obj.carb = Number(obj.carb) || 0;
+      obj.fat = Number(obj.fat) || 0;
+      return obj;
+    } catch (e) {
+      lastError = e;
+      if (!(e.status === 404 || /not found|NOT_FOUND/i.test(e.message || ''))) throw e;
+    }
+  }
+  throw lastError || new Error('เชื่อมต่อ Gemini ไม่ได้');
+}
+
 async function callAnthropic(prompt, apiKey = null) {
   const headers = { "Content-Type": "application/json" };
   if (apiKey) {
@@ -2856,6 +2975,32 @@ function FoodPicker({ mealId, mealLabel, foods, apiKey, onPick, onClose, onSaveF
     }
   };
   
+  const photoInputRef = useRef(null);
+  const [photoLoading, setPhotoLoading] = useState(false);
+  const [sharedResult, setSharedResult] = useState(null);
+  const handlePhoto = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ''; // allow re-selecting the same file
+    if (!file) return;
+    setPhotoLoading(true);
+    setAiError(null);
+    setAiResult(null);
+    try {
+      const b64 = await resizeImageToBase64(file);
+      const result = await aiAnalyzeFoodImage(b64, apiKey);
+      if (result.shared) {
+        setSharedResult(result);
+      } else {
+        const confLabel = result.confidence === 'low' ? ' ⚠️ ความมั่นใจต่ำ ตรวจตัวเลขก่อนบันทึก' : (result.confidence === 'medium' ? ' · ความมั่นใจปานกลาง' : '');
+        setAiResult({ ...result, notes: `📷 ${result.notes || ''}${confLabel}` });
+      }
+    } catch (err) {
+      setAiError(err.message);
+    } finally {
+      setPhotoLoading(false);
+    }
+  };
+  
   // Add the currently-selected food with the chosen qty, then return to search
   // (picker stays open so multiple items can be logged in one session)
   const confirmAdd = (close = false) => {
@@ -2905,13 +3050,20 @@ function FoodPicker({ mealId, mealLabel, foods, apiKey, onPick, onClose, onSaveF
               style={{ width:'100%', padding:'12px 14px', border:'1px solid rgba(0,0,0,0.1)', borderRadius:10, background:'#fff', fontSize:15 }}
             />
             <div style={{ display:'flex', gap:8, marginTop:10 }}>
-              <button onClick={doAISearch} disabled={!query.trim() || aiLoading} style={{ flex:1, padding:'10px', background: query.trim() && !aiLoading ? '#1F2937' : 'rgba(0,0,0,0.08)', color: query.trim() && !aiLoading ? '#fff' : '#A8A6A0', borderRadius:8, fontSize:13, fontWeight:500, display:'flex', alignItems:'center', justifyContent:'center', gap:8 }}>
-                {aiLoading ? <><span className="spinner"></span> กำลังค้นหา...</> : '✨ AI ค้นหาจาก internet'}
+              <button onClick={doAISearch} disabled={!query.trim() || aiLoading || photoLoading} style={{ flex:1, padding:'10px', background: query.trim() && !aiLoading && !photoLoading ? '#1F2937' : 'rgba(0,0,0,0.08)', color: query.trim() && !aiLoading && !photoLoading ? '#fff' : '#A8A6A0', borderRadius:8, fontSize:13, fontWeight:500, display:'flex', alignItems:'center', justifyContent:'center', gap:8 }}>
+                {aiLoading ? <><span className="spinner"></span> กำลังค้นหา...</> : '✨ AI ค้นหา'}
+              </button>
+              <button onClick={() => photoInputRef.current && photoInputRef.current.click()} disabled={aiLoading || photoLoading} title="ถ่ายรูปอาหาร/ฉลาก" style={{ padding:'10px 14px', background: photoLoading ? 'rgba(0,0,0,0.08)' : '#0F766E', color:'#fff', borderRadius:8, fontSize:14, fontWeight:500, display:'flex', alignItems:'center', gap:6 }}>
+                {photoLoading ? <span className="spinner"></span> : '📷'}
               </button>
               <button onClick={() => setShowCustom(true)} style={{ padding:'10px 14px', background:'rgba(0,0,0,0.05)', borderRadius:8, fontSize:13, fontWeight:500 }}>
                 + Custom
               </button>
             </div>
+            <input ref={photoInputRef} type="file" accept="image/*" capture="environment" onChange={handlePhoto} style={{ display:'none' }} />
+            {photoLoading && (
+              <div style={{ fontSize:11, color:'#0F766E', marginTop:6 }}>📷 กำลังวิเคราะห์รูป... (จานอาหาร หรือฉลากโภชนาการก็ได้)</div>
+            )}
           </div>
           {/* Close button stays reachable even when header is hidden under keyboard */}
           {keyboardHeight > 0 && (
@@ -3021,6 +3173,18 @@ function FoodPicker({ mealId, mealLabel, foods, apiKey, onPick, onClose, onSaveF
         )}
         
         {/* Custom add modal */}
+        {sharedResult && (
+          <SharedMealModal
+            result={sharedResult}
+            onConfirm={(picked) => {
+              picked.forEach(({ item, fraction }) => onPick(item, fraction));
+              showToast(`บันทึกมื้อแชร์ ${picked.length} รายการ`, 'success');
+              setSharedResult(null);
+              onClose();
+            }}
+            onClose={() => setSharedResult(null)}
+          />
+        )}
         {showCustom && (
           <CustomFoodModal
             initialName={query}
@@ -3041,6 +3205,103 @@ function FoodPicker({ mealId, mealLabel, foods, apiKey, onPick, onClose, onSaveF
 }
 
 // ============ CUSTOM FOOD MODAL ============
+// ============ SHARED MEAL MODAL (กับข้าวจานกลาง) ============
+// AI identifies every dish on the table; the user picks how much of each dish THEY ate
+function SharedMealModal({ result, onConfirm, onClose }) {
+  const items = result.items || [];
+  const [people, setPeople] = useState(0); // 0 = not applied yet
+  const [fracs, setFracs] = useState(() => items.map(() => 0.25));
+  
+  const FRAC_OPTS = [
+    { l: '✕', v: 0 }, { l: 'ชิม', v: 0.1 }, { l: '¼', v: 0.25 },
+    { l: '⅓', v: 0.333 }, { l: '½', v: 0.5 }, { l: 'หมด', v: 1 }
+  ];
+  const applyEqual = (n) => {
+    setPeople(n);
+    setFracs(items.map(() => +(1 / n).toFixed(3)));
+  };
+  const setFrac = (i, v) => setFracs(fs => fs.map((f, j) => j === i ? v : f));
+  
+  const totals = items.reduce((t, it, i) => ({
+    kcal: t.kcal + it.kcal * fracs[i],
+    p: t.p + it.protein * fracs[i],
+    c: t.c + it.carb * fracs[i],
+    f: t.f + it.fat * fracs[i]
+  }), { kcal: 0, p: 0, c: 0, f: 0 });
+  
+  const confirm = () => {
+    const picked = items
+      .map((item, i) => ({ item, fraction: fracs[i] }))
+      .filter(x => x.fraction > 0);
+    if (picked.length === 0) return;
+    onConfirm(picked);
+  };
+  
+  return (
+    <div onClick={onClose} style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.5)', display:'flex', alignItems:'flex-end', justifyContent:'center', zIndex:300 }}>
+      <div onClick={(e) => e.stopPropagation()} className="modal-enter" style={{ background:'#FAF8F3', width:'100%', maxWidth:480, maxHeight:'92dvh', borderRadius:'18px 18px 0 0', display:'flex', flexDirection:'column' }}>
+        <div style={{ padding:'14px 16px 10px', flexShrink:0 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
+            <div>
+              <div style={{ fontSize:17, fontWeight:600 }}>🍽️ มื้อแชร์ — เจอ {items.length} เมนู</div>
+              <div style={{ fontSize:11, color:'#6B6862', marginTop:2 }}>เลือกสัดส่วนที่<strong>คุณ</strong>กินในแต่ละจาน{result.confidence === 'low' ? ' · ⚠️ AI ไม่ค่อยมั่นใจ ตรวจตัวเลขด้วย' : ''}</div>
+            </div>
+            <button onClick={onClose} style={{ width:32, height:32, borderRadius:8, background:'rgba(0,0,0,0.05)', fontSize:18, flexShrink:0 }}>×</button>
+          </div>
+          <div style={{ display:'flex', gap:6, alignItems:'center', marginTop:10 }}>
+            <span style={{ fontSize:11, color:'#6B6862' }}>แบ่งเท่ากัน:</span>
+            {[2, 3, 4, 5, 6].map(n => (
+              <button key={n} onClick={() => applyEqual(n)} style={{ padding:'6px 10px', minWidth:36, background: people === n ? '#0F766E' : 'rgba(0,0,0,0.05)', color: people === n ? '#fff' : '#6B6862', borderRadius:8, fontSize:12, fontWeight:600 }}>
+                {n} คน
+              </button>
+            ))}
+          </div>
+        </div>
+        
+        <div style={{ flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch', padding:'0 16px', minHeight:0 }}>
+          {items.map((it, i) => (
+            <div key={i} style={{ background:'#fff', borderRadius:10, padding:12, marginBottom:8 }}>
+              <div style={{ display:'flex', justifyContent:'space-between', gap:8, marginBottom:8 }}>
+                <div style={{ fontSize:14, fontWeight:600, flex:1, minWidth:0 }}>{it.name}</div>
+                <div style={{ fontSize:11, color:'#6B6862', flexShrink:0 }}>ทั้งจาน {it.kcal} kcal</div>
+              </div>
+              <div style={{ display:'flex', gap:4 }}>
+                {FRAC_OPTS.map(o => {
+                  const active = Math.abs(fracs[i] - o.v) < 0.02;
+                  return (
+                    <button key={o.l} onClick={() => setFrac(i, o.v)} style={{ flex:1, padding:'8px 0', minHeight:38, background: active ? (o.v === 0 ? '#6B6862' : '#C2410C') : 'rgba(0,0,0,0.05)', color: active ? '#fff' : '#6B6862', borderRadius:8, fontSize:12, fontWeight:600 }}>
+                      {o.l}
+                    </button>
+                  );
+                })}
+              </div>
+              {fracs[i] > 0 && !FRAC_OPTS.some(o => Math.abs(fracs[i] - o.v) < 0.02) && (
+                <div style={{ fontSize:10, color:'#0F766E', marginTop:4 }}>แชร์ {people} คน = {Math.round(fracs[i] * 100)}% ของจาน</div>
+              )}
+              {fracs[i] > 0 && (
+                <div style={{ fontSize:11, color:'#C2410C', fontWeight:600, marginTop:6 }}>
+                  ส่วนของคุณ: {Math.round(it.kcal * fracs[i])} kcal · P {(it.protein * fracs[i]).toFixed(1)} · C {(it.carb * fracs[i]).toFixed(1)} · F {(it.fat * fracs[i]).toFixed(1)}
+                </div>
+              )}
+            </div>
+          ))}
+          <div style={{ height:8 }}></div>
+        </div>
+        
+        <div style={{ padding:'12px 16px calc(12px + env(safe-area-inset-bottom))', borderTop:'1px solid rgba(0,0,0,0.06)', background:'#FAF8F3', flexShrink:0 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', fontSize:12, marginBottom:8 }}>
+            <span style={{ color:'#6B6862' }}>รวมที่คุณกิน</span>
+            <span style={{ fontWeight:700 }}>{Math.round(totals.kcal)} kcal · P {totals.p.toFixed(1)} · C {totals.c.toFixed(1)} · F {totals.f.toFixed(1)}</span>
+          </div>
+          <button onClick={confirm} disabled={!fracs.some(f => f > 0)} style={{ width:'100%', padding:14, background: fracs.some(f => f > 0) ? '#C2410C' : 'rgba(0,0,0,0.08)', color: fracs.some(f => f > 0) ? '#fff' : '#A8A6A0', borderRadius:10, fontSize:14, fontWeight:600 }}>
+            บันทึก {fracs.filter(f => f > 0).length} รายการเข้ามื้อนี้
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CustomFoodModal({ initialName = '', apiKey, onSave, onClose }) {
   const [name, setName] = useState(initialName);
   const [kcal, setKcal] = useState('');
@@ -3097,6 +3358,38 @@ function CustomFoodModal({ initialName = '', apiKey, onSave, onClose }) {
     }
   };
   
+  const photoInputRef = useRef(null);
+  const [photoLoading, setPhotoLoading] = useState(false);
+  const handlePhoto = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    setPhotoLoading(true);
+    setAiError(null);
+    try {
+      const b64 = await resizeImageToBase64(file);
+      const result = await aiAnalyzeFoodImage(b64, apiKey);
+      let r = result;
+      if (result.shared && Array.isArray(result.items)) {
+        if (result.items.length > 1) {
+          throw new Error('รูปนี้มีหลายเมนู — โหมดมื้อแชร์ใช้ได้จากแท็บ "วันนี้" → เพิ่มอาหารในมื้อ → 📷 (หน้านี้บันทึกทีละเมนูเข้าฐานข้อมูล)');
+        }
+        r = { ...result.items[0], confidence: result.confidence };
+      }
+      setName(r.name || name);
+      setServing(r.serving || '1 ส่วน');
+      setKcal(String(r.kcal));
+      setProtein(String(r.protein));
+      setCarb(String(r.carb));
+      setFat(String(r.fat));
+      if (r.confidence === 'low') setAiError('⚠️ AI ความมั่นใจต่ำ — ตรวจตัวเลขก่อนบันทึก');
+    } catch (err) {
+      setAiError(err.message);
+    } finally {
+      setPhotoLoading(false);
+    }
+  };
+  
   const handleSave = () => {
     if (!canSave) return;
     const food = {
@@ -3145,25 +3438,35 @@ function CustomFoodModal({ initialName = '', apiKey, onSave, onClose }) {
             )}
           </div>
           
-          {/* AI Search Button */}
-          <button 
-            onClick={doAISearch} 
-            disabled={!canSearchAI || aiLoading}
-            style={{ 
-              padding:'10px', 
-              background: canSearchAI && !aiLoading ? '#1F2937' : 'rgba(0,0,0,0.08)', 
-              color: canSearchAI && !aiLoading ? '#fff' : '#A8A6A0', 
-              borderRadius:8, 
-              fontSize:13, 
-              fontWeight:500, 
-              display:'flex', 
-              alignItems:'center', 
-              justifyContent:'center', 
-              gap:8 
-            }}
-          >
-            {aiLoading ? <><span className="spinner"></span> AI กำลังค้นหา...</> : '✨ ให้ AI ประเมินค่าให้'}
-          </button>
+          {/* AI Search + Photo Buttons */}
+          <div style={{ display:'flex', gap:8 }}>
+            <button 
+              onClick={doAISearch} 
+              disabled={!canSearchAI || aiLoading || photoLoading}
+              style={{ 
+                flex:1,
+                padding:'10px', 
+                background: canSearchAI && !aiLoading && !photoLoading ? '#1F2937' : 'rgba(0,0,0,0.08)', 
+                color: canSearchAI && !aiLoading && !photoLoading ? '#fff' : '#A8A6A0', 
+                borderRadius:8, 
+                fontSize:13, 
+                fontWeight:500, 
+                display:'flex', 
+                alignItems:'center', 
+                justifyContent:'center', 
+                gap:8 
+              }}
+            >
+              {aiLoading ? <><span className="spinner"></span> AI กำลังค้นหา...</> : '✨ ให้ AI ประเมินค่าให้'}
+            </button>
+            <button onClick={() => photoInputRef.current && photoInputRef.current.click()} disabled={aiLoading || photoLoading} title="ถ่ายรูปอาหาร/ฉลากโภชนาการ" style={{ padding:'10px 16px', background: photoLoading ? 'rgba(0,0,0,0.08)' : '#0F766E', color:'#fff', borderRadius:8, fontSize:14, fontWeight:500, display:'flex', alignItems:'center', justifyContent:'center' }}>
+              {photoLoading ? <span className="spinner"></span> : '📷'}
+            </button>
+          </div>
+          <input ref={photoInputRef} type="file" accept="image/*" capture="environment" onChange={handlePhoto} style={{ display:'none' }} />
+          {photoLoading && (
+            <div style={{ fontSize:11, color:'#0F766E' }}>📷 กำลังวิเคราะห์รูป... (จานอาหาร หรือฉลากโภชนาการ)</div>
+          )}
           
           {aiError && (
             <div style={{ background:'#FEE2E2', color:'#991B1B', padding:'8px 12px', borderRadius:8, fontSize:12 }}>
@@ -3785,14 +4088,14 @@ function SettingsView({ profile, goals, apiKey, saveProfile, saveGoals, saveApiK
       {/* API Key (only in standalone mode) */}
       {storageMode === 'browser' && (
         <div style={{ background:'#fff', padding:16, borderRadius:12, marginBottom:14, boxShadow:'0 1px 2px rgba(0,0,0,0.03)' }}>
-          <div style={{ fontSize:14, fontWeight:600, marginBottom:4 }}>🔑 AI API Key</div>
+          <div style={{ fontSize:14, fontWeight:600, marginBottom:4 }}>🔑 Google Gemini API Key</div>
           <div style={{ fontSize:12, color:'#6B6862', marginBottom:10 }}>
-            สำหรับ AI ค้นหาอาหาร — รองรับทั้ง <strong>Google Gemini</strong> และ <strong>Anthropic Claude</strong> (ตรวจจับอัตโนมัติจาก key)
+            สำหรับ AI ค้นหาอาหาร — ใช้ Gemini Flash (free tier เพียงพอสำหรับการใช้ส่วนตัว)
           </div>
           
           <div style={{ background:'#F0FDF4', border:'1px solid #BBF7D0', padding:'10px 12px', borderRadius:8, fontSize:11, color:'#15803D', marginBottom:10 }}>
-            <strong>💡 แนะนำ Gemini</strong> — ถูกกว่า Anthropic ~50 เท่า ($0.0001/call vs $0.005/call)<br/>
-            Key เริ่มด้วย <code style={{ background:'rgba(0,0,0,0.05)', padding:'1px 4px', borderRadius:3 }}>AIza...</code> สมัครฟรีที่ <strong>aistudio.google.com</strong>
+            ขอ key ฟรีที่ <strong>aistudio.google.com/apikey</strong> — key เริ่มด้วย <code style={{ background:'rgba(0,0,0,0.05)', padding:'1px 4px', borderRadius:3 }}>AIza...</code><br/>
+            ระบบเรียก gemini-2.5-flash-lite เป็นหลัก และ fallback เป็นรุ่นล่าสุดอัตโนมัติ
           </div>
           
           <div style={{ display:'flex', gap:6 }}>
@@ -3800,7 +4103,7 @@ function SettingsView({ profile, goals, apiKey, saveProfile, saveGoals, saveApiK
               type={showKey ? 'text' : 'password'}
               value={k}
               onChange={(e) => setK(e.target.value)}
-              placeholder="AIza... (Gemini) หรือ sk-ant-... (Claude)"
+              placeholder="AIza..."
               style={{ flex:1, padding:'10px 12px', border:'1px solid rgba(0,0,0,0.1)', borderRadius:8, fontSize:13, fontFamily:'monospace' }}
             />
             <button onClick={() => setShowKey(!showKey)} style={{ padding:'10px 12px', background:'rgba(0,0,0,0.05)', borderRadius:8, fontSize:12 }}>
@@ -3810,7 +4113,7 @@ function SettingsView({ profile, goals, apiKey, saveProfile, saveGoals, saveApiK
           
           {k && (
             <div style={{ fontSize:11, color:'#6B6862', marginTop:6, padding:'6px 10px', background:'rgba(0,0,0,0.03)', borderRadius:6 }}>
-              {k.startsWith('AIza') ? '🟢 ตรวจพบ Google Gemini key' : k.startsWith('sk-ant-') ? '🟣 ตรวจพบ Anthropic Claude key' : '⚠️ Key format ไม่รู้จัก'}
+              {k.startsWith('AIza') ? '🟢 Gemini key ถูกต้อง พร้อมใช้งาน' : k.startsWith('sk-ant-') ? '🟣 ตรวจพบ Claude key — ใช้ได้ แต่แนะนำ Gemini (ถูกกว่ามาก)' : '⚠️ Key ควรเริ่มด้วย AIza... (จาก aistudio.google.com/apikey)'}
             </div>
           )}
           
@@ -4356,6 +4659,24 @@ function WorkoutView({ profile, goals, showToast }) {
           )}
         </div>
         
+        {/* Session progress bar */}
+        {session.exercises.length > 0 && (() => {
+          const allSets = session.exercises.reduce((s, ex2) => s + (((ex2.sets_done || []).length) || 3), 0);
+          const doneSets = session.exercises.reduce((s, ex2) => s + (ex2.sets_done || []).filter(x => x.done).length, 0);
+          const pct = allSets > 0 ? Math.round(doneSets / allSets * 100) : 0;
+          return (
+            <div style={{ marginBottom:12 }}>
+              <div style={{ display:'flex', justifyContent:'space-between', fontSize:11, color:'#6B6862', marginBottom:4 }}>
+                <span>ความคืบหน้า {doneSets}/{allSets} set</span>
+                <span style={{ fontWeight:700, color: pct === 100 ? '#0F766E' : '#C2410C' }}>{pct === 100 ? '✓ ครบ' : pct + '%'}</span>
+              </div>
+              <div style={{ height:6, background:'rgba(0,0,0,0.06)', borderRadius:3, overflow:'hidden' }}>
+                <div style={{ height:'100%', width:pct + '%', background: pct === 100 ? '#0F766E' : '#C2410C', borderRadius:3, transition:'width 0.3s ease' }}></div>
+              </div>
+            </div>
+          );
+        })()}
+        
         {/* Quick action buttons when empty */}
         {session.exercises.length === 0 && (
           <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
@@ -4382,48 +4703,37 @@ function WorkoutView({ profile, goals, showToast }) {
                 { weight:'', reps:'', done:false },
                 { weight:'', reps:'', done:false }
               ]);
-          const safetyBadge = getSafetyBadge(exDef.safety);
-          const partExercises = ex.part ? getExercisesForPart(ex.part) : [];
-          const hasAlternatives = partExercises.length > 1;
+          const doneCount = setsArr.filter(s => s.done).length;
           return (
             <div key={ex.id} style={{ background:'#FAF8F3', padding:12, borderRadius:10, marginBottom:8 }}>
               {/* Body part header */}
-              {ex.part && (
-                <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:6 }}>
-                  <div style={{ fontSize:10, fontWeight:600, color:'#C2410C', textTransform:'uppercase', letterSpacing:'0.5px' }}>
-                    {idx + 1}. 📍 {ex.part}
-                  </div>
-                  {ex.reps && !isCardio && (
-                    <div style={{ fontSize:10, color:'#6B6862' }}>
-                      · เป้า {ex.sets}×{ex.reps}
-                    </div>
-                  )}
+              <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:6 }}>
+                <div style={{ fontSize:10, fontWeight:600, color:'#C2410C', textTransform:'uppercase', letterSpacing:'0.5px' }}>
+                  {idx + 1}.{ex.part ? ' ' + ex.part : ''}
                 </div>
-              )}
-              
-              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:8, gap:6 }}>
-                {rowMediaEx && <ExtGifThumb exercise={rowMediaEx} size={46} />}
-                <div style={{ flex:1, minWidth:0 }}>
-                  <div style={{ fontSize:14, fontWeight:600, marginBottom:4 }}>{exDef.th}</div>
-                  <div style={{ display:'flex', gap:6, flexWrap:'wrap', alignItems:'center' }}>
-                    <span style={{ fontSize:9, padding:'2px 6px', borderRadius:4, background: safetyBadge.bg, color: safetyBadge.color, fontWeight:500 }}>
-                      {safetyBadge.icon} {safetyBadge.label}
-                    </span>
-                    <span style={{ fontSize:10, color:'#6B6862' }}>{exDef.equipment}</span>
-                    {exDef.rest > 0 && <span style={{ fontSize:10, color:'#6B6862' }}>· ⏱️ พัก {exDef.rest}s</span>}
+                {ex.reps && !isCardio && (
+                  <div style={{ fontSize:10, color:'#6B6862' }}>
+                    · เป้า {ex.sets}×{ex.reps}
                   </div>
-                </div>
-                <button onClick={() => removeExercise(ex.id)} style={{ fontSize:16, color:'#A8A6A0', padding:'2px 6px', flexShrink:0 }}>×</button>
+                )}
+                {!isCardio && (
+                  <div style={{ marginLeft:'auto', fontSize:10, fontWeight:700, padding:'2px 8px', borderRadius:10, color: doneCount === setsArr.length ? '#fff' : '#6B6862', background: doneCount === setsArr.length ? '#0F766E' : 'rgba(0,0,0,0.06)' }}>
+                    {doneCount}/{setsArr.length} set
+                  </div>
+                )}
               </div>
               
-              {/* Tips + Swap buttons */}
-              <div style={{ display:'flex', gap:6, marginBottom:10 }}>
-                <button onClick={() => setShowTips(ex.id)} style={{ flex:1, padding:'8px', background:'#fff', borderRadius:6, fontSize:11, fontWeight:500, color:'#0369A1', border:'1px solid rgba(3,105,161,0.2)' }}>
-                  💡 วิธีเล่น
-                </button>
-                <button onClick={() => setShowSwap(ex.id)} style={{ flex:1, padding:'8px', background:'#fff', borderRadius:6, fontSize:11, fontWeight:500, color:'#C2410C', border:'1px solid rgba(194,65,12,0.2)' }}>
-                  🔄 เปลี่ยนท่า{hasAlternatives ? ` (${partExercises.length})` : ''}
-                </button>
+              <div style={{ display:'flex', alignItems:'center', marginBottom:10, gap:8 }}>
+                {rowMediaEx && <ExtGifThumb exercise={rowMediaEx} size={46} />}
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:15, fontWeight:600, marginBottom:2 }}>{exDef.th}</div>
+                  <div style={{ fontSize:11, color:'#6B6862', whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{exDef.equipment}{exDef.rest > 0 ? ` · พัก ${exDef.rest}s` : ''}</div>
+                </div>
+                <div style={{ display:'flex', gap:4, flexShrink:0 }}>
+                  <button onClick={() => setShowTips(ex.id)} title="วิธีเล่น" style={{ width:34, height:34, borderRadius:8, background:'#fff', border:'1px solid rgba(3,105,161,0.2)', fontSize:15, display:'flex', alignItems:'center', justifyContent:'center' }}>💡</button>
+                  <button onClick={() => setShowSwap(ex.id)} title="เปลี่ยนท่า" style={{ width:34, height:34, borderRadius:8, background:'#fff', border:'1px solid rgba(194,65,12,0.2)', fontSize:14, display:'flex', alignItems:'center', justifyContent:'center' }}>🔄</button>
+                  <button onClick={() => removeExercise(ex.id)} title="ลบท่า" style={{ width:34, height:34, borderRadius:8, background:'#fff', border:'1px solid rgba(0,0,0,0.08)', fontSize:17, color:'#A8A6A0', display:'flex', alignItems:'center', justifyContent:'center' }}>×</button>
+                </div>
               </div>
               
               {/* Sets */}
@@ -4496,7 +4806,7 @@ function WorkoutView({ profile, goals, showToast }) {
                 </div>
               ) : (
                 <>
-                  <div style={{ display:'grid', gridTemplateColumns:'24px 1fr 1fr 36px 28px', gap:6, fontSize:10, color:'#6B6862', marginBottom:4, padding:'0 4px' }}>
+                  <div style={{ display:'grid', gridTemplateColumns:'24px 1fr 1fr 48px 28px', gap:6, fontSize:10, color:'#6B6862', marginBottom:4, padding:'0 4px' }}>
                     <div>SET</div>
                     <div>น้ำหนัก (kg)</div>
                     <div>เรพ</div>
@@ -4504,15 +4814,15 @@ function WorkoutView({ profile, goals, showToast }) {
                     <div></div>
                   </div>
                   {setsArr.map((set, sIdx) => (
-                    <div key={sIdx} style={{ display:'grid', gridTemplateColumns:'24px 1fr 1fr 36px 28px', gap:6, alignItems:'center', marginBottom:4 }}>
-                      <div style={{ fontSize:12, fontWeight:600, color:'#6B6862', textAlign:'center' }}>{sIdx + 1}</div>
+                    <div key={sIdx} style={{ display:'grid', gridTemplateColumns:'24px 1fr 1fr 48px 28px', gap:6, alignItems:'center', marginBottom:6 }}>
+                      <div style={{ fontSize:13, fontWeight:600, color:'#6B6862', textAlign:'center' }}>{sIdx + 1}</div>
                       <input
                         type="text"
                         inputMode="decimal"
                         value={set.weight || ''}
                         onChange={(e) => updateSet(ex.id, sIdx, 'weight', e.target.value)}
                         placeholder="-"
-                        style={{ padding:'8px', border:'1px solid rgba(0,0,0,0.1)', borderRadius:6, fontSize:13, background:'#fff', textAlign:'center', minWidth:0 }}
+                        style={{ padding:'11px 8px', border:'1px solid rgba(0,0,0,0.1)', borderRadius:8, fontSize:17, fontWeight:600, background:'#fff', textAlign:'center', minWidth:0 }}
                       />
                       <input
                         type="text"
@@ -4520,9 +4830,9 @@ function WorkoutView({ profile, goals, showToast }) {
                         value={set.reps || ''}
                         onChange={(e) => updateSet(ex.id, sIdx, 'reps', e.target.value)}
                         placeholder="-"
-                        style={{ padding:'8px', border:'1px solid rgba(0,0,0,0.1)', borderRadius:6, fontSize:13, background:'#fff', textAlign:'center', minWidth:0 }}
+                        style={{ padding:'11px 8px', border:'1px solid rgba(0,0,0,0.1)', borderRadius:8, fontSize:17, fontWeight:600, background:'#fff', textAlign:'center', minWidth:0 }}
                       />
-                      <button onClick={() => toggleSetDone(ex.id, sIdx)} style={{ padding:'8px', background: set.done ? '#0F766E' : 'rgba(0,0,0,0.05)', color: set.done ? '#fff' : '#6B6862', borderRadius:6, fontSize:13, fontWeight:600 }}>
+                      <button onClick={() => toggleSetDone(ex.id, sIdx)} style={{ minHeight:44, background: set.done ? '#0F766E' : 'rgba(0,0,0,0.05)', color: set.done ? '#fff' : '#6B6862', borderRadius:8, fontSize:16, fontWeight:700 }}>
                         {set.done ? '✓' : '○'}
                       </button>
                       <button onClick={() => removeSet(ex.id, sIdx)} disabled={setsArr.length <= 1} style={{ fontSize:14, color: setsArr.length <= 1 ? '#D4D2CC' : '#A8A6A0', opacity: setsArr.length <= 1 ? 0.3 : 1 }}>−</button>
@@ -4933,7 +5243,7 @@ function ExercisePicker({ onSelect, onClose, initialSource = 'coach' }) {
           )}
           {extStatus === 'ready' && (
             <div>
-              <div style={{ fontSize:10, color:'#A8A6A0', marginBottom:8 }}>พบ {extFiltered.length} ท่า</div>
+              <div style={{ fontSize:11, color:'#6B6862', marginBottom:8 }}>พบ {extFiltered.length} ท่า · แตะท่าเพื่อดูวิธีเล่น หรือกด ＋ เพื่อเพิ่มเลย</div>
               {extFiltered.slice(0, extLimit).map(e => (
                 <div key={e.id} style={{ width:'100%', padding:'10px 12px', background:'#fff', borderRadius:8, marginBottom:6, display:'flex', gap:10, alignItems:'center' }}>
                   <button onClick={() => setPreviewEx(ExtLib.map[e.id])} style={{ display:'flex', gap:10, alignItems:'center', flex:1, minWidth:0, textAlign:'left' }}>
@@ -4945,7 +5255,6 @@ function ExercisePicker({ onSelect, onClose, initialSource = 'coach' }) {
                         <span style={{ fontSize:10, color:'#6B6862' }}>· {EXT_EQUIP_TH[e.equipment] || e.equipment}</span>
                         <span style={{ fontSize:9, color:'#A8A6A0', textTransform:'uppercase' }}>{e.type === 'compound' ? 'COMPOUND' : 'ISO'}</span>
                       </div>
-                      <div style={{ fontSize:9, color:'#A8A6A0', marginTop:2 }}>แตะเพื่อดูวิธีเล่น</div>
                     </div>
                   </button>
                   <button onClick={() => onSelect(e.id)} style={{ width:36, height:36, borderRadius:10, background:'#C2410C', color:'#fff', fontSize:20, fontWeight:600, flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center' }}>＋</button>
@@ -5070,7 +5379,7 @@ function BottomNav({ tab, setTab }) {
   const tabs = [
     { id: 'today', label: 'วันนี้', icon: '📅' },
     { id: 'workout', label: 'เทรน', icon: '🏋️' },
-    { id: 'trends', label: 'Trends', icon: '📊' },
+    { id: 'trends', label: 'เทรนด์', icon: '📊' },
     { id: 'foods', label: 'อาหาร', icon: '🥘' },
     { id: 'settings', label: 'ตั้งค่า', icon: '⚙️' }
   ];
